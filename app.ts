@@ -39,6 +39,18 @@ function send(res: ServerResponse, result: HttpResult): void {
   res.end(text);
 }
 
+/** Write an already-serialized JSON body (the GET response cache's hit path). */
+function sendText(res: ServerResponse, status: number, text: string, headers?: Record<string, string>): void {
+  requestCounter += 1;
+  res.writeHead(status, {
+    'x-github-request-id': `FORGE-${requestCounter.toString(16).toUpperCase().padStart(8, '0')}`,
+    ...(headers ?? {}),
+    'content-type': JSON_TYPE,
+    'content-length': String(Buffer.byteLength(text)),
+  });
+  res.end(text);
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -64,6 +76,14 @@ function authorized(req: IncomingMessage): boolean {
 
 export function createApp(): Server {
   const forge = new Forge();
+  // GET response cache for the REST surface. A REST response body is a pure
+  // function of the store, and every store change arrives through a non-GET
+  // request, so a cached body stays valid until the next non-GET request
+  // bumps the mutation version. An entry carries the version it was built
+  // under and is served only while that version is still current, so a
+  // mutation interleaved with a read can never leave a stale body servable.
+  const getCache = new Map<string, { version: number; status: number; text: string; headers?: Record<string, string> }>();
+  let mutationVersion = 0;
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
@@ -87,19 +107,38 @@ export function createApp(): Server {
         // Git smart HTTP: /{owner}/{repo}.git/...
         const gitPath = isGitPath(path);
         if (gitPath) {
-          send(res, routeGit(forge, method, gitPath, url.searchParams, body, req.headers['git-protocol']));
+          if (method !== 'GET') mutationVersion += 1;
+          const gitResult = await routeGit(forge, method, gitPath, url.searchParams, body, req.headers['git-protocol']);
+          if (method !== 'GET') mutationVersion += 1;
+          send(res, gitResult);
           return;
         }
 
         // REST v3.
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+          const isGet = method === 'GET';
+          if (!isGet) mutationVersion += 1;
+          const cacheKey = isGet ? `${host} ${path}?${url.searchParams.toString()}` : '';
+          if (isGet) {
+            const hit = getCache.get(cacheKey);
+            if (hit && hit.version === mutationVersion) {
+              sendText(res, hit.status, hit.text, hit.headers);
+              return;
+            }
+          }
           const segments = path
             .slice('/api/v3'.length)
             .split('/')
             .filter((segment) => segment.length > 0)
             .map((segment) => decodeURIComponent(segment));
-          const parsed = method === 'GET' ? undefined : parseBody(body);
-          send(res, routeRest(forge, method, segments, url.searchParams, parsed === undefined ? {} : parsed, host));
+          const parsed = isGet ? undefined : parseBody(body);
+          const result = routeRest(forge, method, segments, url.searchParams, parsed === undefined ? {} : parsed, host);
+          if (!isGet) mutationVersion += 1;
+          if (isGet && result.status === 200 && result.body !== undefined && result.rawBody === undefined) {
+            if (getCache.size > 2048) getCache.clear();
+            getCache.set(cacheKey, { version: mutationVersion, status: result.status, text: JSON.stringify(result.body), headers: result.headers });
+          }
+          send(res, result);
           return;
         }
 
@@ -111,6 +150,7 @@ export function createApp(): Server {
             return;
           }
           const result = executeGraphQL(forge, parsed);
+          mutationVersion += 1;
           send(res, { status: result.status, body: result.body });
           return;
         }
@@ -127,6 +167,7 @@ export function createApp(): Server {
             return;
           }
           const outcome = handleMcp(forge, parsed);
+          mutationVersion += 1;
           send(res, { status: outcome.status, body: outcome.body, headers: outcome.headers });
           return;
         }

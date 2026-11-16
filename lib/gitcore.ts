@@ -2,7 +2,7 @@
 // Standard library only (node:crypto, node:zlib), exactly as git computes them.
 
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync } from 'node:zlib';
 
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 export interface GitObject {
@@ -191,7 +191,22 @@ export function commitAncestors(store: ObjectStore, tip: string): Set<string> {
 }
 
 export function isAncestor(store: ObjectStore, ancestor: string, tip: string): boolean {
-  return commitAncestors(store, tip).has(ancestor);
+  // Walk from the tip and stop the moment the ancestor is reached: a
+  // fast-forward check on a sequential push finds its answer one step back,
+  // where building the tip's whole ancestor set cost a full history parse
+  // on every push. The visited set keeps the walk linear in the worst case.
+  const seen = new Set<string>();
+  const stack = [peelToCommit(store, tip)];
+  while (stack.length) {
+    const oid = stack.pop()!;
+    if (oid === ancestor) return true;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = store.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    stack.push(...parseCommit(object.data).parents);
+  }
+  return false;
 }
 
 /**
@@ -363,8 +378,26 @@ interface PendingObject {
   refBase?: string;
 }
 
+/**
+ * Inflate the one zlib stream that starts at `offset` in a pack, resolving
+ * with its bytes and the exact number of compressed bytes it occupied. The
+ * stream reports its own bytes read, which replaces the old binary search
+ * that re-inflated the object about a dozen times just to find where its
+ * stream ended: one inflate per object now, not a search through them.
+ */
+function inflateStreamAt(pack: Buffer, offset: number): Promise<{ data: Buffer; consumed: number }> {
+  return new Promise((resolve, reject) => {
+    const stream = createInflate();
+    const chunks: Buffer[] = [];
+    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve({ data: Buffer.concat(chunks), consumed: stream.bytesRead }));
+    stream.end(pack.subarray(offset));
+  });
+}
+
 /** Read a pack into the store; resolves OFS_DELTA and REF_DELTA (bases may be thin, from the store). */
-export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
+export async function readPackInto(store: ObjectStore, pack: Buffer): Promise<string[]> {
   if (pack.length < 12 + 20 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a pack');
   const count = pack.readUInt32BE(8);
   let offset = 12;
@@ -387,19 +420,19 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
         baseOffset = ((baseOffset + 1) << 7) | (byte & 0x7f);
       }
       const baseIndex = offsets.indexOf(offsets[index] - baseOffset);
-      const inflated = inflateSync(pack.subarray(offset));
-      offset += consumedInflate(pack, offset, inflated);
+      const { data: inflated, consumed } = await inflateStreamAt(pack, offset);
+      offset += consumed;
       pending.push({ type: 'blob', data: inflated, ofsBase: baseIndex });
     } else if (typeCode === 7) {
       // REF_DELTA: the base object's id follows the header.
       const baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const inflated = inflateSync(pack.subarray(offset));
-      offset += consumedInflate(pack, offset, inflated);
+      const { data: inflated, consumed } = await inflateStreamAt(pack, offset);
+      offset += consumed;
       pending.push({ type: 'blob', data: inflated, refBase: baseOid });
     } else {
-      const inflated = inflateSync(pack.subarray(offset));
-      offset += consumedInflate(pack, offset, inflated);
+      const { data: inflated, consumed } = await inflateStreamAt(pack, offset);
+      offset += consumed;
       pending.push({ type: header.type, data: inflated });
     }
   }
@@ -429,25 +462,4 @@ export function readPackInto(store: ObjectStore, pack: Buffer): string[] {
     added.push(store.put(object.type, object.data));
   }
   return added;
-}
-
-/**
- * How many compressed bytes the zlib stream at `offset` occupies. Node's inflateSync inflates one
- * stream and ignores trailing bytes but does not report where it stopped, so binary-search the
- * smallest slice that inflates to the same bytes as the whole remainder.
- */
-function consumedInflate(pack: Buffer, offset: number, full: Buffer): number {
-  let lo = 1;
-  let hi = pack.length - offset;
-  while (lo < hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    try {
-      const part = inflateSync(pack.subarray(offset, offset + mid));
-      if (part.equals(full)) hi = mid;
-      else lo = mid + 1;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return lo;
 }

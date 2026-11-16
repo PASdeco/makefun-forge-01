@@ -334,7 +334,7 @@ interface PushCommand {
   ref: string;
 }
 
-export function receivePack(forge: Forge, repo: Repo, body: Buffer): HttpResult {
+export async function receivePack(forge: Forge, repo: Repo, body: Buffer): Promise<HttpResult> {
   try {
     const { lines, rest } = splitPktLines(body);
     const commands: PushCommand[] = [];
@@ -357,7 +357,7 @@ export function receivePack(forge: Forge, repo: Repo, body: Buffer): HttpResult 
     let unpackDetail = 'ok';
     if (rest.length > 0) {
       try {
-        readPackInto(forge.store, rest);
+        await readPackInto(forge.store, rest);
       } catch (err) {
         unpackOk = false;
         unpackDetail = err instanceof Error ? err.message : 'error';
@@ -423,14 +423,14 @@ export function isGitPath(path: string): { owner: string; repo: string; tail: st
   return { owner: match[1], repo: match[2], tail: match[3] ?? '' };
 }
 
-export function routeGit(
+export async function routeGit(
   forge: Forge,
   method: string,
   gitPath: { owner: string; repo: string; tail: string },
   query: URLSearchParams,
   body: Buffer,
   gitProtocol: string | undefined,
-): HttpResult {
+): Promise<HttpResult> {
   if (gitPath.owner !== VIEWER.login) return notFound();
   const repo = forge.getRepo(gitPath.repo);
   if (!repo) return notFound();
